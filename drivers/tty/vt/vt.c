@@ -869,6 +869,9 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
 	if (!newscreen)
 		return -ENOMEM;
 
+	if (vc == sel_cons)
+		clear_selection();
+
 	old_rows = vc->vc_rows;
 	old_row_size = vc->vc_size_row;
 
@@ -1166,7 +1169,7 @@ static void csi_J(struct vc_data *vc, int vpar)
 			break;
 		case 3: /* erase scroll-back buffer (and whole display) */
 			scr_memsetw(vc->vc_screenbuf, vc->vc_video_erase_char,
-				    vc->vc_screenbuf_size >> 1);
+				    vc->vc_screenbuf_size);
 			set_origin(vc);
 			if (CON_IS_VISIBLE(vc))
 				update_screen(vc);
