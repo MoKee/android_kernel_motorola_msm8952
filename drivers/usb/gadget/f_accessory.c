@@ -246,6 +246,7 @@ static inline struct acc_dev *func_to_dev(struct usb_function *f)
 static struct usb_request *acc_request_new(struct usb_ep *ep, int buffer_size)
 {
 	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
+
 	if (!req)
 		return NULL;
 
@@ -707,9 +708,10 @@ static ssize_t acc_write(struct file *fp, const char __user *buf,
 			req->zero = 0;
 		} else {
 			xfer = count;
-			/* If the data length is a multple of the
+			/*
+			 * If the data length is a multple of the
 			 * maxpacket size then send a zero length packet(ZLP).
-			*/
+			 */
 			req->zero = ((xfer % dev->ep_in->maxpacket) == 0);
 		}
 		if (copy_from_user(req->buf, buf, xfer)) {
@@ -854,11 +856,11 @@ static int acc_ctrlrequest(struct usb_composite_dev *cdev,
 	unsigned long flags;
 
 /*
-	printk(KERN_INFO "acc_ctrlrequest "
-			"%02x.%02x v%04x i%04x l%u\n",
-			b_requestType, b_request,
-			w_value, w_index, w_length);
-*/
+ *	printk(KERN_INFO "acc_ctrlrequest "
+ *			"%02x.%02x v%04x i%04x l%u\n",
+ *			b_requestType, b_request,
+ *			w_value, w_index, w_length);
+ */
 
 	if (b_requestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
 		if (b_request == ACCESSORY_START) {
@@ -1048,6 +1050,7 @@ acc_function_unbind(struct usb_configuration *c, struct usb_function *f)
 static void acc_start_work(struct work_struct *data)
 {
 	char *envp[2] = { "ACCESSORY=START", NULL };
+
 	kobject_uevent_env(&acc_device.this_device->kobj, KOBJ_CHANGE, envp);
 }
 
