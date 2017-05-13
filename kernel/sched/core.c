@@ -568,6 +568,39 @@ static inline void init_hrtick(void)
 #endif	/* CONFIG_SCHED_HRTICK */
 
 /*
+ * cmpxchg based fetch_or, macro so it works for different integer types
+ */
+#define fetch_or(ptr, val)						\
+({	typeof(*(ptr)) __old, __val = *(ptr);				\
+ 	for (;;) {							\
+ 		__old = cmpxchg((ptr), __val, __val | (val));		\
+ 		if (__old == __val)					\
+ 			break;						\
+ 		__val = __old;						\
+ 	}								\
+ 	__old;								\
+})
+
+#ifdef TIF_POLLING_NRFLAG
+/*
+ * Atomically set TIF_NEED_RESCHED and test for TIF_POLLING_NRFLAG,
+ * this avoids any races wrt polling state changes and thereby avoids
+ * spurious IPIs.
+ */
+static bool set_nr_and_not_polling(struct task_struct *p)
+{
+	struct thread_info *ti = task_thread_info(p);
+	return !(fetch_or(&ti->flags, _TIF_NEED_RESCHED) & _TIF_POLLING_NRFLAG);
+}
+#else
+static bool set_nr_and_not_polling(struct task_struct *p)
+{
+	set_tsk_need_resched(p);
+	return true;
+}
+#endif
+
+/*
  * resched_task - mark a task 'to be rescheduled now'.
  *
  * On UP this means the setting of the need_resched flag, on SMP it
@@ -584,15 +617,14 @@ void resched_task(struct task_struct *p)
 	if (test_tsk_need_resched(p))
 		return;
 
-	set_tsk_need_resched(p);
-
 	cpu = task_cpu(p);
-	if (cpu == smp_processor_id())
-		return;
 
-	/* NEED_RESCHED must be visible before we test polling */
-	smp_mb();
-	if (!tsk_is_polling(p))
+	if (cpu == smp_processor_id()) {
+		set_tsk_need_resched(p);
+		return;
+	}
+
+	if (set_nr_and_not_polling(p))
 		smp_send_reschedule(cpu);
 }
 
@@ -3717,10 +3749,51 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 	success = 1; /* we're going to change ->state */
 
+	/*
+	 * Ensure we load p->on_rq _after_ p->state, otherwise it would
+	 * be possible to, falsely, observe p->on_rq == 0 and get stuck
+	 * in smp_cond_load_acquire() below.
+	 *
+	 * sched_ttwu_pending()                 try_to_wake_up()
+	 *   [S] p->on_rq = 1;                  [L] P->state
+	 *       UNLOCK rq->lock  -----.
+	 *                              \
+	 *				 +---   RMB
+	 * schedule()                   /
+	 *       LOCK rq->lock    -----'
+	 *       UNLOCK rq->lock
+	 *
+	 * [task p]
+	 *   [S] p->state = UNINTERRUPTIBLE     [L] p->on_rq
+	 *
+	 * Pairs with the UNLOCK+LOCK on rq->lock from the
+	 * last wakeup of our task and the schedule that got our task
+	 * current.
+	 */
+	smp_rmb();
 	if (p->on_rq && ttwu_remote(p, wake_flags))
 		goto stat;
 
 #ifdef CONFIG_SMP
+	/*
+	 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
+	 * possible to, falsely, observe p->on_cpu == 0.
+	 *
+	 * One must be running (->on_cpu == 1) in order to remove oneself
+	 * from the runqueue.
+	 *
+	 *  [S] ->on_cpu = 1;	[L] ->on_rq
+	 *      UNLOCK rq->lock
+	 *			RMB
+	 *      LOCK   rq->lock
+	 *  [S] ->on_rq = 0;    [L] ->on_cpu
+	 *
+	 * Pairs with the full barrier implied in the UNLOCK+LOCK on rq->lock
+	 * from the consecutive calls to schedule(); the first switching to our
+	 * task, the second putting it to sleep.
+	 */
+	smp_rmb();
+
 	/*
 	 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
 	 * possible to, falsely, observe p->on_cpu == 0.
@@ -4630,10 +4703,13 @@ static long calc_load_fold_active(struct rq *this_rq)
 static unsigned long
 calc_load(unsigned long load, unsigned long exp, unsigned long active)
 {
-	load *= exp;
-	load += active * (FIXED_1 - exp);
-	load += 1UL << (FSHIFT - 1);
-	return load >> FSHIFT;
+	unsigned long newload;
+
+	newload = load * exp + active * (FIXED_1 - exp);
+	if (active >= load)
+		newload += FIXED_1-1;
+
+	return newload / FIXED_1;
 }
 
 #ifdef CONFIG_NO_HZ_COMMON
@@ -5294,7 +5370,7 @@ void __kprobes add_preempt_count(int val)
 	if (DEBUG_LOCKS_WARN_ON((preempt_count() < 0)))
 		return;
 #endif
-	preempt_count() += val;
+	add_preempt_count_notrace(val);
 #ifdef CONFIG_DEBUG_PREEMPT
 	/*
 	 * Spinlock count overflowing soon?
@@ -5325,7 +5401,7 @@ void __kprobes sub_preempt_count(int val)
 
 	if (preempt_count() == val)
 		trace_preempt_on(CALLER_ADDR0, get_parent_ip(CALLER_ADDR1));
-	preempt_count() -= val;
+	sub_preempt_count_notrace(val);
 }
 EXPORT_SYMBOL(sub_preempt_count);
 
@@ -6388,6 +6464,8 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 
 	if (policy == -1) /* setparam */
 		policy = p->policy;
+	else
+		policy &= ~SCHED_RESET_ON_FORK;
 
 	p->policy = policy;
 
@@ -6681,8 +6759,13 @@ change:
 
 	if (running)
 		p->sched_class->set_curr_task(rq);
-	if (on_rq)
-		enqueue_task(rq, p, 0);
+	if (on_rq) {
+		/*
+		 * We enqueue to tail when the priority of a task is
+		 * increased (user space view).
+		 */
+		enqueue_task(rq, p, oldprio <= p->prio ? ENQUEUE_HEAD : 0);
+	}
 
 	check_class_changed(rq, p, prev_class, oldprio);
 	task_rq_unlock(rq, p, &flags);
@@ -7619,7 +7702,7 @@ void show_state_filter(unsigned long state_filter)
 		"  task                        PC stack   pid father\n");
 #endif
 	rcu_read_lock();
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		/*
 		 * reset the NMI-timeout, listing all files on a slow
 		 * console might take a lot of time:
@@ -7627,7 +7710,7 @@ void show_state_filter(unsigned long state_filter)
 		touch_nmi_watchdog();
 		if (!state_filter || (p->state & state_filter))
 			sched_show_task(p);
-	} while_each_thread(g, p);
+	}
 
 	touch_all_softlockup_watchdogs();
 
@@ -10209,7 +10292,7 @@ void normalize_rt_tasks(void)
 	struct rq *rq;
 
 	read_lock_irqsave(&tasklist_lock, flags);
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		/*
 		 * Only normalize user tasks:
 		 */
@@ -10240,8 +10323,7 @@ void normalize_rt_tasks(void)
 
 		__task_rq_unlock(rq);
 		raw_spin_unlock(&p->pi_lock);
-	} while_each_thread(g, p);
-
+	}
 	read_unlock_irqrestore(&tasklist_lock, flags);
 }
 
@@ -10427,10 +10509,10 @@ static inline int tg_has_rt_tasks(struct task_group *tg)
 {
 	struct task_struct *g, *p;
 
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		if (rt_task(p) && task_rq(p)->rt.tg == tg)
 			return 1;
-	} while_each_thread(g, p);
+	}
 
 	return 0;
 }
